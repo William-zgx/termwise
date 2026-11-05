@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/bash \"${PLUGIN_ROOT}/hooks/stop.sh\"",
+            "timeout": 30,
+            "statusMessage": "Relingo：查回复里的生词"
+          }
+        ]
+      }
+    ]
+  }
+}
