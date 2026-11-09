@@ -43,8 +43,11 @@ def credentials_path() -> str:
 
 
 def _keychain_get() -> Optional[str]:
-    r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
-                        "-a", KEYCHAIN_ACCOUNT, "-w"], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+                            "-a", KEYCHAIN_ACCOUNT, "-w"], capture_output=True, text=True)
+    except OSError:  # 非 macOS：没有 security 命令
+        return None
     return r.stdout.strip() or None
 
 
@@ -71,13 +74,17 @@ def save_token(token: str, insecure_storage: bool = False) -> str:
         raise ValueError("token 为空或含有意外字符")
     # 走 `security -i` 的 stdin，token 不出现在进程参数里（ps 看不到）
     cmd = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -l "termwise Relingo token" -w "{token}"\n'
-    r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
-    if r.returncode == 0 and not r.stderr.strip() and _keychain_get() == token:
+    try:
+        r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+        ok, err = r.returncode == 0 and not r.stderr.strip(), r.stderr.strip()
+    except OSError:  # 非 macOS：没有 security 命令
+        ok, err = False, "找不到 security 命令（非 macOS 无钥匙串）"
+    if ok and _keychain_get() == token:
         _remove_credentials_file()
         return "钥匙串（service=termwise-relingo）"
     if not insecure_storage:
         raise RuntimeError("写入钥匙串失败（当前环境可能无法访问钥匙串）："
-                           + r.stderr.strip().replace(token, "***")
+                           + err.replace(token, "***")
                            + "\n可加 --insecure-storage 改存到权限 600 的文件里")
     path = credentials_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -96,11 +103,15 @@ def _remove_credentials_file():
 
 
 def delete_token() -> bool:
-    r = subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE,
-                        "-a", KEYCHAIN_ACCOUNT], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE,
+                            "-a", KEYCHAIN_ACCOUNT], capture_output=True, text=True)
+        deleted = r.returncode == 0
+    except OSError:  # 非 macOS：没有 security 命令
+        deleted = False
     had_file = os.path.exists(credentials_path())
     _remove_credentials_file()
-    return r.returncode == 0 or had_file
+    return deleted or had_file
 
 
 # ---------- 登录：与扩展相同的 OAuth 设备流 / 邮箱验证码 ----------
@@ -118,7 +129,12 @@ def oauth_login(cfg: dict, provider: str, state_db: sqlite3.Connection, open_bro
     print(f"在浏览器里用 {name} 账号登录 Relingo：\n  {url}\n等待授权完成（最多 {int(poll_seconds * max_polls)} 秒，Ctrl-C 取消）…",
           file=sys.stderr)
     if open_browser:
-        subprocess.run(["open", url], capture_output=True)
+        for opener in ("open", "xdg-open"):
+            try:
+                subprocess.run([opener, url], capture_output=True)
+                break
+            except OSError:
+                continue
     for _ in range(max_polls):
         time.sleep(poll_seconds)
         account = client.call(f"oauth{name}Profile", {"id": sid}) or {}

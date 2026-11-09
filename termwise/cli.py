@@ -185,13 +185,14 @@ def cmd_lookup(args):
     for w in args.words:
         n = w.lower()
         e = local.lookup([n]).get(n) if local else None
-        remote = ann.lex.lookup([n]).get(n) if ann.lex is not local else None
+        is_remote = not isinstance(ann.lex, EcdictLexicon)
+        remote = ann.lex.lookup([n]).get(n) if is_remote else None
         if not e and not remote:
             print(f"{w}: 未收录")
             continue
         base = remote or e
         state = "★生词本" if store.is_star(n, base.word) else "已掌握" if store.is_known(n, base.word) else ""
-        if ann.lex is not local:
+        if is_remote:
             src = (f"Relingo：{'★' if remote.starred else ''}生词 {remote.translation}" if remote and remote.hard
                    else "Relingo：不是生词（低于级别或已掌握）")
             print(f"{base.word} /{base.phonetic}/  {src} {state}".rstrip())

@@ -1,6 +1,9 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
+
+from termwise import relingo
 
 from termwise.relingo import RelingoError, RelingoLexicon, _translation, is_highlightable
 
@@ -82,6 +85,17 @@ class RelingoTest(unittest.TestCase):
                 ("removeVocabularyWords", {"id": "m1", "words": ["ephemeral"]}),
                 ("removeStarWord", {"word": "ephemeral"}),
             ])
+    def test_get_token_without_security_binary(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(relingo.subprocess, "run", side_effect=FileNotFoundError("security")), \
+                mock.patch.object(relingo, "credentials_path", return_value=os.path.join(tmp, "credentials")):
+            self.assertIsNone(relingo._keychain_get())
+            self.assertIsNone(relingo.get_token())
+            self.assertEqual(relingo.token_storage(), "无")
+            self.assertFalse(relingo.delete_token())
+            with self.assertRaises(RuntimeError):
+                relingo.save_token("abc")
+
 
 if __name__ == "__main__":
     unittest.main()
