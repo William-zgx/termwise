@@ -127,6 +127,11 @@ class EcdictLexicon:
         ).fetchone()
 
     def _derived_rank(self, word: str, rank: int) -> int:
+        # 自身带 gre 标签的词（untoward / remiss / reprove / disabuse）意思不能从
+        # 前缀 + 词根推出，不借词根词频，否则永远不会被标注
+        row = self._get(word)
+        if row and "gre" in (row[4] or "").split():
+            return rank
         for p in _PREFIXES:
             root = word[len(p):]
             if word.startswith(p) and len(root) >= 4:
