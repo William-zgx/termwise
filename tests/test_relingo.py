@@ -1,5 +1,8 @@
+import io
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -68,6 +71,100 @@ class RelingoTest(unittest.TestCase):
             n = lex.db.execute("SELECT count(*) FROM words").fetchone()[0]
             self.assertEqual(n, 0)
 
+
+    def test_rate_limit_reserves_slots_across_connections(self):
+        interval = 0.2
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "relingo-cache.db")
+        db1 = sqlite3.connect(path, timeout=5, check_same_thread=False)
+        self.addCleanup(db1.close)
+        db2 = sqlite3.connect(path, timeout=5, check_same_thread=False)
+        self.addCleanup(db2.close)
+        db1.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value REAL)")
+        db1.execute("INSERT INTO state VALUES (?,?)", ("last_request_at", -interval))
+        db1.commit()
+        clients = [relingo.Client(dict(CFG, min_interval_seconds=interval), db, None)
+                   for db in (db1, db2)]
+
+        start_barrier = threading.Barrier(2)
+        first_transport = threading.Event()
+        second_transport = threading.Event()
+        transport_starts = []
+        transport_lock = threading.Lock()
+        clock_lock = threading.Lock()
+        clock_now = [0.0]
+        errors = []
+
+        def clock_time():
+            with clock_lock:
+                return clock_now[0]
+
+        def clock_sleep(delay):
+            # A queued caller can wake only after the earlier caller reaches HTTP.
+            if not first_transport.wait(timeout=5):
+                raise AssertionError("request slept before the first mocked transport started")
+            with clock_lock:
+                clock_now[0] += delay
+
+        fake_clock = mock.Mock()
+        fake_clock.time.side_effect = clock_time
+        fake_clock.sleep.side_effect = clock_sleep
+
+        def gated_urlopen(req, timeout):
+            with transport_lock:
+                transport_starts.append(clock_time())
+                transport_number = len(transport_starts)
+            if transport_number == 1:
+                first_transport.set()
+                if not second_transport.wait(timeout=5):
+                    raise AssertionError("second request did not reach the mocked transport")
+            else:
+                second_transport.set()
+            return io.BytesIO(b'{"code": 0, "data": {}}')
+
+        def call(client):
+            try:
+                start_barrier.wait(timeout=5)
+                client.call("parseContent3", {"words": []})
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=call, args=(client,)) for client in clients]
+        with mock.patch.object(relingo, "time", fake_clock), \
+                mock.patch.object(relingo.urllib.request, "urlopen", side_effect=gated_urlopen):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(transport_starts), 2)
+        transport_starts.sort()
+        self.assertGreaterEqual(transport_starts[1] - transport_starts[0], interval)
+
+    def test_far_future_request_state_does_not_cause_a_long_sleep(self):
+        now = 1000.0
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = sqlite3.connect(os.path.join(tmp.name, "relingo-cache.db"))
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value REAL)")
+        db.execute("INSERT INTO state VALUES (?,?)", ("last_request_at", now + 3600))
+        db.commit()
+        client = relingo.Client(dict(CFG, min_interval_seconds=0.2), db, None)
+        fake_clock = mock.Mock()
+        fake_clock.time.return_value = now
+
+        with mock.patch.object(relingo, "time", fake_clock), \
+                mock.patch.object(relingo.urllib.request, "urlopen",
+                                  return_value=io.BytesIO(b'{"code": 0, "data": {}}')) as urlopen:
+            self.assertEqual(client.call("parseContent3", {"words": []}), {})
+
+        fake_clock.sleep.assert_not_called()
+        urlopen.assert_called_once()
+        self.assertEqual(db.execute("SELECT value FROM state WHERE key='last_request_at'").fetchone()[0], now)
 
     def test_sync_mark_uses_the_extension_calls(self):
         books = [{"_id": "s1", "id": "default", "lang": "en", "type": "strange"},
