@@ -179,6 +179,27 @@ class Client:
         self.db.executemany("INSERT OR REPLACE INTO state VALUES (?,?)", list(kv.items()))
         self.db.commit()
 
+    def _reserve_request(self) -> float:
+        """原子预留下一次请求的开始时间，提交后再在锁外等待。"""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            now = time.time()
+            interval = float(self.cfg["min_interval_seconds"])
+            last_request_at = self._state("last_request_at")
+            max_queue_delay = max(60.0, interval * 64)
+            if last_request_at > now + max_queue_delay:
+                # 至多排队 64 个槽位；更远的时间戳视为时钟回拨或状态损坏。
+                next_request_at = now
+            else:
+                next_request_at = max(now, last_request_at + interval)
+            self.db.execute("INSERT OR REPLACE INTO state VALUES (?,?)",
+                            ("last_request_at", next_request_at))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return next_request_at
+
     def available(self) -> tuple[bool, str]:
         down = self._state("down_until")
         if time.time() < down:
@@ -186,11 +207,11 @@ class Client:
         return True, ""
 
     def call(self, fn: str, body: dict) -> dict:
-        # 限频：两次请求之间至少间隔 min_interval_seconds（等待而不是丢弃）
-        wait = self._state("last_request_at") + float(self.cfg["min_interval_seconds"]) - time.time()
+        # 限频：先在短事务中跨进程预留槽位，再在锁外等待，等待而不是丢弃
+        next_request_at = self._reserve_request()
+        wait = next_request_at - time.time()
         if wait > 0:
-            time.sleep(min(wait, 10))
-        self._set_state(last_request_at=time.time())
+            time.sleep(wait)
         headers = {
             "Content-Type": "application/json",
             "x-relingo-version": self.version,
